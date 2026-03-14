@@ -1,0 +1,6 @@
+.agent_data/
+cache/
+out/
+lib/
+
+frontend/node_modules/
