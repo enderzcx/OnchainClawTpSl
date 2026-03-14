@@ -1,6 +1,6 @@
 .agent_data/
 cache/
 out/
-lib/
+/lib/
 
 frontend/node_modules/

@@ -173,6 +173,11 @@ contract OnchainClawTpSlCallbackTest is Test {
         assertEq(singleGroupId, 0);
     }
 
+    function testBracketGroupGetterRevertsForMissingGroup() public {
+        vm.expectRevert("bracket_group_missing");
+        callback.bracketGroup(999);
+    }
+
     function testPauseResumeAndFailWhenAllowanceFallsToZero() public {
         vm.prank(user);
         uint256 orderId = callback.createOrder(
@@ -209,6 +214,39 @@ contract OnchainClawTpSlCallbackTest is Test {
 
         assertEq(uint8(_callbackStatus(orderId)), uint8(OnchainClawTpSlCallback.OrderStatus.Executed));
         assertEq(token1.balanceOf(user), 4e18);
+    }
+
+    function testPartialExecutionScalesMinAmountOutProportionally() public {
+        vm.prank(user);
+        uint256 orderId = callback.createOrder(
+            address(pair), true, 5e18, 1e18, COEFFICIENT, 15e17, OnchainClawTpSlCallback.OrderType.TakeProfit
+        );
+
+        vm.prank(user);
+        token0.approve(address(callback), 2e18);
+        router.setNextAmountOut(4e17);
+
+        callback.executeOrder(address(0), orderId);
+
+        assertEq(router.lastAmountIn(), 2e18);
+        assertEq(router.lastAmountOutMin(), 4e17);
+        assertEq(uint8(_callbackStatus(orderId)), uint8(OnchainClawTpSlCallback.OrderStatus.Executed));
+    }
+
+    function testBracketLegFailureLeavesSiblingActive() public {
+        vm.prank(user);
+        (uint256 stopLossOrderId, uint256 takeProfitOrderId) =
+            callback.createBracketOrders(address(pair), true, 5e18, COEFFICIENT, 1e18, 1e18, 3e18, 15e17);
+
+        vm.prank(user);
+        token0.approve(address(callback), 0);
+
+        callback.executeOrder(address(0), takeProfitOrderId);
+
+        assertEq(uint8(_callbackStatus(takeProfitOrderId)), uint8(OnchainClawTpSlCallback.OrderStatus.Failed));
+        assertEq(uint8(_callbackStatus(stopLossOrderId)), uint8(OnchainClawTpSlCallback.OrderStatus.Active));
+        assertEq(callback.siblingOrders(stopLossOrderId), 0);
+        assertEq(callback.siblingOrders(takeProfitOrderId), 0);
     }
 
     function testRescueAdminCanRecoverStuckEthAndTokens() public {

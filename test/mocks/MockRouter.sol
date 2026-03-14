@@ -5,6 +5,8 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract MockRouter {
     uint256 public nextAmountOut;
+    uint256 public lastAmountIn;
+    uint256 public lastAmountOutMin;
 
     function setNextAmountOut(uint256 amountOut) external {
         nextAmountOut = amountOut;
@@ -18,6 +20,8 @@ contract MockRouter {
         uint256
     ) external returns (uint256[] memory amounts) {
         require(path.length == 2, "path_length");
+        lastAmountIn = amountIn;
+        lastAmountOutMin = amountOutMin;
         require(nextAmountOut >= amountOutMin, "insufficient_amount_out");
 
         IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
