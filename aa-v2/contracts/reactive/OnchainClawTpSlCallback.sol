@@ -29,7 +29,7 @@ contract OnchainClawTpSlCallback is AbstractCallback {
     }
 
     struct Order {
-        uint256 sharedOrderRef;
+        uint256 bracketGroupRef;
         address owner;
         address pair;
         address tokenSell;
@@ -45,7 +45,7 @@ contract OnchainClawTpSlCallback is AbstractCallback {
         OrderStatus status;
     }
 
-    struct SharedOrderData {
+    struct BracketGroupData {
         address owner;
         address pair;
         address tokenSell;
@@ -74,13 +74,20 @@ contract OnchainClawTpSlCallback is AbstractCallback {
     event OrderPaused(uint256 indexed orderId);
     event OrderResumed(uint256 indexed orderId);
     event OrderFailed(uint256 indexed orderId);
+    event BracketGroupCreated(
+        uint256 indexed bracketGroupId,
+        uint256 indexed stopLossOrderId,
+        uint256 indexed takeProfitOrderId,
+        address owner,
+        address pair
+    );
 
     address public immutable rescueAdmin;
     address public immutable router;
     uint256 public nextOrderId;
-    uint256 public nextSharedOrderId;
+    uint256 public nextBracketGroupId;
     mapping(uint256 => Order) private _orders;
-    mapping(uint256 => SharedOrderData) private _sharedOrders;
+    mapping(uint256 => BracketGroupData) private _bracketGroups;
     mapping(uint256 => uint256) public siblingOrders;
 
     constructor(address authorizedCallbackSender, address routerAddress, bool vmMode)
@@ -141,7 +148,7 @@ contract OnchainClawTpSlCallback is AbstractCallback {
             bool resolvedSellToken0,
             uint256 resolvedAmount,
             uint256 resolvedCoefficient
-        ) = _resolveSharedData(order);
+        ) = _resolveBracketGroupData(order);
 
         return (
             orderId,
@@ -156,6 +163,46 @@ contract OnchainClawTpSlCallback is AbstractCallback {
             order.threshold,
             order.orderType,
             order.status
+        );
+    }
+
+    function bracketGroupIdForOrder(uint256 orderId) external view returns (bool exists, uint256 bracketGroupId) {
+        uint256 bracketGroupRef = _orders[orderId].bracketGroupRef;
+        if (bracketGroupRef == 0) {
+            return (false, 0);
+        }
+
+        return (true, bracketGroupRef - 1);
+    }
+
+    function isBracketOrder(uint256 orderId) external view returns (bool) {
+        return _orders[orderId].bracketGroupRef != 0;
+    }
+
+    function bracketGroup(uint256 bracketGroupId)
+        external
+        view
+        returns (
+            address owner,
+            address pair,
+            address tokenSell,
+            address tokenBuy,
+            bool sellToken0,
+            uint256 amount,
+            uint256 coefficient
+        )
+    {
+        BracketGroupData storage bracketGroupData = _bracketGroups[bracketGroupId];
+        require(bracketGroupData.owner != address(0), "bracket_group_missing");
+
+        return (
+            bracketGroupData.owner,
+            bracketGroupData.pair,
+            bracketGroupData.tokenSell,
+            bracketGroupData.tokenBuy,
+            bracketGroupData.sellToken0,
+            bracketGroupData.amount,
+            bracketGroupData.coefficient
         );
     }
 
@@ -212,10 +259,10 @@ contract OnchainClawTpSlCallback is AbstractCallback {
         _requirePairLiquidity(pair);
         _requireAllowance(tokenSell, msg.sender, amount);
 
-        uint256 sharedOrderId = nextSharedOrderId;
-        nextSharedOrderId = sharedOrderId + 1;
+        uint256 bracketGroupId = nextBracketGroupId;
+        nextBracketGroupId = bracketGroupId + 1;
 
-        _sharedOrders[sharedOrderId] = SharedOrderData({
+        _bracketGroups[bracketGroupId] = BracketGroupData({
             owner: msg.sender,
             pair: pair,
             tokenSell: tokenSell,
@@ -229,12 +276,14 @@ contract OnchainClawTpSlCallback is AbstractCallback {
         takeProfitOrderId = stopLossOrderId + 1;
         nextOrderId = stopLossOrderId + 2;
 
-        _storeBracketLeg(stopLossOrderId, sharedOrderId, stopLossMinAmountOut, stopLossThreshold, OrderType.StopLoss);
+        _storeBracketLeg(stopLossOrderId, bracketGroupId, stopLossMinAmountOut, stopLossThreshold, OrderType.StopLoss);
         _storeBracketLeg(
-            takeProfitOrderId, sharedOrderId, takeProfitMinAmountOut, takeProfitThreshold, OrderType.TakeProfit
+            takeProfitOrderId, bracketGroupId, takeProfitMinAmountOut, takeProfitThreshold, OrderType.TakeProfit
         );
         siblingOrders[stopLossOrderId] = takeProfitOrderId + 1;
         siblingOrders[takeProfitOrderId] = stopLossOrderId + 1;
+
+        emit BracketGroupCreated(bracketGroupId, stopLossOrderId, takeProfitOrderId, msg.sender, pair);
     }
 
     function cancelOrder(uint256 orderId) external orderExists(orderId) onlyOrderOwner(orderId) {
@@ -270,7 +319,7 @@ contract OnchainClawTpSlCallback is AbstractCallback {
             bool resolvedSellToken0,
             uint256 resolvedAmount,
             uint256 resolvedCoefficient
-        ) = _resolveSharedData(order);
+        ) = _resolveBracketGroupData(order);
 
         (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(resolvedPair).getReserves();
         require(
@@ -366,17 +415,17 @@ contract OnchainClawTpSlCallback is AbstractCallback {
 
     function _orderExists(uint256 orderId) internal view returns (bool) {
         Order storage order = _orders[orderId];
-        return order.owner != address(0) || order.sharedOrderRef != 0;
+        return order.owner != address(0) || order.bracketGroupRef != 0;
     }
 
     function _orderOwner(uint256 orderId) internal view returns (address) {
         Order storage order = _orders[orderId];
-        uint256 sharedOrderRef = order.sharedOrderRef;
-        if (sharedOrderRef == 0) {
+        uint256 bracketGroupRef = order.bracketGroupRef;
+        if (bracketGroupRef == 0) {
             return order.owner;
         }
 
-        return _sharedOrders[sharedOrderRef - 1].owner;
+        return _bracketGroups[bracketGroupRef - 1].owner;
     }
 
     function _failOrder(uint256 orderId, Order storage order) internal {
@@ -437,34 +486,34 @@ contract OnchainClawTpSlCallback is AbstractCallback {
 
     function _storeBracketLeg(
         uint256 orderId,
-        uint256 sharedOrderId,
+        uint256 bracketGroupId,
         uint256 minAmountOut,
         uint256 threshold,
         OrderType orderType
     ) internal {
         Order storage order = _orders[orderId];
-        order.sharedOrderRef = sharedOrderId + 1;
+        order.bracketGroupRef = bracketGroupId + 1;
         order.minAmountOut = minAmountOut;
         order.threshold = threshold;
         order.orderType = orderType;
         order.status = OrderStatus.Active;
 
-        SharedOrderData storage sharedOrder = _sharedOrders[sharedOrderId];
+        BracketGroupData storage bracketGroupData = _bracketGroups[bracketGroupId];
         emit OrderCreated(
-            sharedOrder.pair,
+            bracketGroupData.pair,
             orderId,
-            sharedOrder.sellToken0,
-            sharedOrder.tokenSell,
-            sharedOrder.tokenBuy,
-            sharedOrder.amount,
+            bracketGroupData.sellToken0,
+            bracketGroupData.tokenSell,
+            bracketGroupData.tokenBuy,
+            bracketGroupData.amount,
             minAmountOut,
-            sharedOrder.coefficient,
+            bracketGroupData.coefficient,
             threshold,
             uint8(orderType)
         );
     }
 
-    function _resolveSharedData(Order storage order)
+    function _resolveBracketGroupData(Order storage order)
         internal
         view
         returns (
@@ -477,8 +526,8 @@ contract OnchainClawTpSlCallback is AbstractCallback {
             uint256 coefficient
         )
     {
-        uint256 sharedOrderRef = order.sharedOrderRef;
-        if (sharedOrderRef == 0) {
+        uint256 bracketGroupRef = order.bracketGroupRef;
+        if (bracketGroupRef == 0) {
             return (
                 order.owner,
                 order.pair,
@@ -490,15 +539,15 @@ contract OnchainClawTpSlCallback is AbstractCallback {
             );
         }
 
-        SharedOrderData storage sharedOrder = _sharedOrders[sharedOrderRef - 1];
+        BracketGroupData storage bracketGroupData = _bracketGroups[bracketGroupRef - 1];
         return (
-            sharedOrder.owner,
-            sharedOrder.pair,
-            sharedOrder.tokenSell,
-            sharedOrder.tokenBuy,
-            sharedOrder.sellToken0,
-            sharedOrder.amount,
-            sharedOrder.coefficient
+            bracketGroupData.owner,
+            bracketGroupData.pair,
+            bracketGroupData.tokenSell,
+            bracketGroupData.tokenBuy,
+            bracketGroupData.sellToken0,
+            bracketGroupData.amount,
+            bracketGroupData.coefficient
         );
     }
 

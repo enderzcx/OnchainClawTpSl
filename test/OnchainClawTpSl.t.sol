@@ -5,12 +5,36 @@ import "forge-std/Test.sol";
 
 import "reactive/OnchainClawTpSlCallback.sol";
 import "reactive/OnchainClawTpSlReactive.sol";
+import "reactive/lib/AbstractCallback.sol";
+import "reactive/lib/AbstractReactive.sol";
 import "reactive/lib/IReactive.sol";
 
 import "./mocks/MockERC20.sol";
 import "./mocks/MockPair.sol";
 import "./mocks/MockRouter.sol";
 import "./mocks/MockSubscriptionService.sol";
+
+contract AbstractReactiveHarness is AbstractReactive {
+    constructor(address subscriptionService, address reactiveNetworkAddress, bool vmMode)
+        AbstractReactive(subscriptionService, reactiveNetworkAddress, vmMode)
+    {}
+
+    function runVmOnly() external view vmOnly returns (bool) {
+        return true;
+    }
+
+    function runRnOnly() external view rnOnly returns (bool) {
+        return true;
+    }
+}
+
+contract AbstractCallbackHarness is AbstractCallback {
+    constructor(address authorizedCallbackSender, bool vmMode) AbstractCallback(authorizedCallbackSender, vmMode) {}
+
+    function runAuthorizedOnly() external view authorizedSenderOnly returns (bool) {
+        return true;
+    }
+}
 
 contract OnchainClawTpSlCallbackTest is Test {
     MockERC20 internal token0;
@@ -100,6 +124,53 @@ contract OnchainClawTpSlCallbackTest is Test {
         assertEq(callback.siblingOrders(stopLossOrderId), 0);
         assertEq(callback.siblingOrders(takeProfitOrderId), 0);
         assertEq(token1.balanceOf(user), 4e18);
+    }
+
+    function testBracketGroupAccessorsExposeSharedOrderData() public {
+        vm.expectEmit(true, true, true, true);
+        emit OnchainClawTpSlCallback.BracketGroupCreated(0, 0, 1, user, address(pair));
+
+        vm.prank(user);
+        (uint256 stopLossOrderId, uint256 takeProfitOrderId) =
+            callback.createBracketOrders(address(pair), true, 5e18, COEFFICIENT, 1e18, 1e18, 3e18, 15e17);
+
+        (bool stopLossHasGroup, uint256 stopLossGroupId) = callback.bracketGroupIdForOrder(stopLossOrderId);
+        (bool takeProfitHasGroup, uint256 takeProfitGroupId) = callback.bracketGroupIdForOrder(takeProfitOrderId);
+
+        assertTrue(callback.isBracketOrder(stopLossOrderId));
+        assertTrue(callback.isBracketOrder(takeProfitOrderId));
+        assertTrue(stopLossHasGroup);
+        assertTrue(takeProfitHasGroup);
+        assertEq(stopLossGroupId, 0);
+        assertEq(takeProfitGroupId, 0);
+
+        (
+            address owner,
+            address orderPair,
+            address tokenSell,
+            address tokenBuy,
+            bool sellToken0,
+            uint256 amount,
+            uint256 coefficient
+        ) = callback.bracketGroup(0);
+
+        assertEq(owner, user);
+        assertEq(orderPair, address(pair));
+        assertEq(tokenSell, address(token0));
+        assertEq(tokenBuy, address(token1));
+        assertTrue(sellToken0);
+        assertEq(amount, 5e18);
+        assertEq(coefficient, COEFFICIENT);
+
+        vm.prank(user);
+        uint256 singleOrderId = callback.createOrder(
+            address(pair), true, 1e18, 1, COEFFICIENT, 10e17, OnchainClawTpSlCallback.OrderType.StopLoss
+        );
+
+        (bool singleHasGroup, uint256 singleGroupId) = callback.bracketGroupIdForOrder(singleOrderId);
+        assertFalse(callback.isBracketOrder(singleOrderId));
+        assertFalse(singleHasGroup);
+        assertEq(singleGroupId, 0);
     }
 
     function testPauseResumeAndFailWhenAllowanceFallsToZero() public {
@@ -308,6 +379,74 @@ contract OnchainClawTpSlReactiveTest is Test {
         assertFalse(vmReactive.subscribedPairs(pair));
     }
 
+    function testUnknownLifecycleEventsAreIgnored() public {
+        IReactive.LogRecord memory cancelledLog = _buildLifecycleLog(reactiveContract.ORDER_CANCELLED_TOPIC_0(), 999, 0);
+
+        vm.prank(reactiveNetwork);
+        reactiveContract.react(cancelledLog);
+
+        (uint256 id, address trackedPair,,,,,) = reactiveContract.trackedOrders(999);
+        assertEq(id, 0);
+        assertEq(trackedPair, address(0));
+        assertEq(reactiveContract.pairOrderCount(pair), 0);
+        assertFalse(reactiveContract.subscribedPairs(pair));
+    }
+
+    function testTriggerCooldownSkipsImmediateRetrigger() public {
+        OnchainClawTpSlReactive vmReactive = new OnchainClawTpSlReactive(
+            address(service), reactiveNetwork, callbackContract, ORIGIN_CHAIN_ID, REACTIVE_CHAIN_ID, true
+        );
+
+        vmReactive.react(
+            IReactive.LogRecord({
+                chainId: ORIGIN_CHAIN_ID,
+                _contract: callbackContract,
+                topic_0: vmReactive.ORDER_CREATED_TOPIC_0(),
+                topic_1: uint256(uint160(pair)),
+                topic_2: 9,
+                topic_3: 0,
+                data: abi.encode(
+                    true,
+                    address(0x1),
+                    address(0x2),
+                    5e18,
+                    1e18,
+                    COEFFICIENT,
+                    15e17,
+                    uint8(OnchainClawTpSlReactive.OrderType.TakeProfit)
+                ),
+                blockNumber: 1,
+                txHash: bytes32(uint256(11)),
+                logIndex: 0
+            })
+        );
+
+        IReactive.LogRecord memory syncLog = IReactive.LogRecord({
+            chainId: ORIGIN_CHAIN_ID,
+            _contract: pair,
+            topic_0: vmReactive.SYNC_TOPIC_0(),
+            topic_1: 0,
+            topic_2: 0,
+            topic_3: 0,
+            data: abi.encode(uint112(1e18), uint112(2e18)),
+            blockNumber: 2,
+            txHash: bytes32(uint256(12)),
+            logIndex: 0
+        });
+
+        bytes32 callbackTopic = keccak256("Callback(uint256,address,uint64,bytes)");
+
+        vm.recordLogs();
+        vmReactive.react(syncLog);
+        Vm.Log[] memory firstLogs = vm.getRecordedLogs();
+        assertEq(_countLogsWithTopic(firstLogs, callbackTopic), 1);
+
+        vm.recordLogs();
+        vmReactive.react(syncLog);
+        Vm.Log[] memory secondLogs = vm.getRecordedLogs();
+        assertEq(_countLogsWithTopic(secondLogs, callbackTopic), 0);
+    }
+
     function testRepeatedTriggeringEventuallyFailsAndUntracks() public {
         OnchainClawTpSlReactive vmReactive = new OnchainClawTpSlReactive(
             address(service), reactiveNetwork, callbackContract, ORIGIN_CHAIN_ID, REACTIVE_CHAIN_ID, true
@@ -365,5 +504,63 @@ contract OnchainClawTpSlReactiveTest is Test {
         assertEq(uint8(status), uint8(OnchainClawTpSlReactive.OrderStatus.Failed));
         assertEq(vmReactive.pairOrderCount(pair), 0);
         assertFalse(vmReactive.subscribedPairs(pair));
+    }
+
+    function _countLogsWithTopic(Vm.Log[] memory logs, bytes32 topic) internal pure returns (uint256 count) {
+        uint256 totalLogs = logs.length;
+        for (uint256 index = 0; index < totalLogs;) {
+            if (logs[index].topics.length > 0 && logs[index].topics[0] == topic) {
+                count += 1;
+            }
+            unchecked {
+                ++index;
+            }
+        }
+    }
+}
+
+contract AbstractAccessSemanticsTest is Test {
+    address internal reactiveNetwork = address(0xB0B);
+    address internal callbackSender = address(0xCA11);
+
+    function testAbstractReactiveHelpersReflectAuthorizationModel() public {
+        AbstractReactiveHarness liveHarness = new AbstractReactiveHarness(address(0), reactiveNetwork, false);
+        AbstractReactiveHarness vmHarness = new AbstractReactiveHarness(address(0), reactiveNetwork, true);
+
+        assertTrue(liveHarness.isReactiveCallerAuthorized(reactiveNetwork));
+        assertFalse(liveHarness.isReactiveCallerAuthorized(address(this)));
+        assertTrue(liveHarness.isReactiveNetworkCaller(reactiveNetwork));
+        assertFalse(liveHarness.isReactiveNetworkCaller(address(this)));
+        assertTrue(vmHarness.isReactiveCallerAuthorized(address(this)));
+
+        vm.prank(reactiveNetwork);
+        assertTrue(liveHarness.runVmOnly());
+        vm.prank(reactiveNetwork);
+        assertTrue(liveHarness.runRnOnly());
+
+        vm.expectRevert(abi.encodeWithSelector(AbstractReactive.UnauthorizedReactiveCaller.selector, address(this)));
+        liveHarness.runVmOnly();
+
+        assertTrue(vmHarness.runVmOnly());
+        assertTrue(vmHarness.runRnOnly());
+    }
+
+    function testAbstractCallbackHelpersReflectAuthorizationModel() public {
+        AbstractCallbackHarness liveHarness = new AbstractCallbackHarness(callbackSender, false);
+        AbstractCallbackHarness vmHarness = new AbstractCallbackHarness(callbackSender, true);
+
+        assertTrue(liveHarness.isCallbackCallerAuthorized(callbackSender));
+        assertFalse(liveHarness.isCallbackCallerAuthorized(address(this)));
+        assertTrue(liveHarness.isDirectCallbackSender(callbackSender));
+        assertFalse(liveHarness.isDirectCallbackSender(address(this)));
+        assertTrue(vmHarness.isCallbackCallerAuthorized(address(this)));
+
+        vm.prank(callbackSender);
+        assertTrue(liveHarness.runAuthorizedOnly());
+
+        vm.expectRevert(abi.encodeWithSelector(AbstractCallback.UnauthorizedCallbackCaller.selector, address(this)));
+        liveHarness.runAuthorizedOnly();
+
+        assertTrue(vmHarness.runAuthorizedOnly());
     }
 }
